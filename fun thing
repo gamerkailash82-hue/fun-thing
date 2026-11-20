@@ -1,0 +1,914 @@
+-- // Combined Xeno Menu (Players Tab + Powers Tab)
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+
+local player = Players.LocalPlayer
+local camera = Workspace.CurrentCamera
+
+-- Cleanup old GUIs
+for _, name in ipairs({"XenoTpFlingGui", "XenoCustomPowerPanel", "XenoCombinedMenu"}) do
+	local old = player:WaitForChild("PlayerGui"):FindFirstChild(name)
+	if old then old:Destroy() end
+end
+
+-- ==========================================
+-- SHARED STATE
+-- ==========================================
+local connections = {}
+local function trackConn(conn)
+	table.insert(connections, conn)
+	return conn
+end
+
+local isFlinging = false
+local spectatingTarget = nil
+local autoRefreshEnabled = true
+
+-- Powers state
+local states = {
+	spin = false,
+	fly = false,
+	speed = false,
+	jump = false,
+	giant = false,
+	bambooSwing = true
+}
+
+local config = {
+	spinSpeed = 3000,
+	walkSpeed = 80,
+	jumpPower = 150,
+	charSize = 2.5,
+	flySpeed = 80,
+	swingAngle = 360,
+	swingForce = 7500
+}
+
+local character, humanoid, rootPart
+local flyBodyGyro, flyBodyVelocity
+local activeSwingSeat = nil
+local swingCyclePhase = 0
+local angleButtons = {}
+local angleInputBox
+
+-- ==========================================
+-- HELPERS (Players)
+-- ==========================================
+local function getTargetPart(targetPlr)
+	local char = targetPlr and targetPlr.Character
+	if not char then return nil end
+	return char:FindFirstChild("HumanoidRootPart")
+		or char:FindFirstChild("Torso")
+		or char:FindFirstChild("UpperTorso")
+		or char:FindFirstChildWhichIsA("BasePart")
+end
+
+local function getMyParts()
+	local char = player.Character
+	if not char then return nil, nil, nil end
+	local root = char:FindFirstChild("HumanoidRootPart") or char:FindFirstChildWhichIsA("BasePart")
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	return char, root, hum
+end
+
+local function clearSeatWelds(char)
+	for _, d in ipairs(char:GetDescendants()) do
+		if d:IsA("Weld") or d:IsA("WeldConstraint") then
+			if not d.Parent:IsA("Motor6D") then
+				d:Destroy()
+			end
+		end
+	end
+end
+
+local function stopViewing()
+	spectatingTarget = nil
+	if unviewBtn then unviewBtn.Visible = false end
+	local _, _, myHum = getMyParts()
+	camera.CameraType = Enum.CameraType.Custom
+	if myHum and myHum.Parent then
+		camera.CameraSubject = myHum
+	end
+end
+
+local function toggleViewPlayer(targetPlr)
+	if spectatingTarget == targetPlr then
+		stopViewing()
+		return
+	end
+	local tHum = targetPlr.Character and targetPlr.Character:FindFirstChildOfClass("Humanoid")
+	local tPart = getTargetPart(targetPlr)
+	if tHum or tPart then
+		spectatingTarget = targetPlr
+		if unviewBtn then unviewBtn.Visible = true end
+		camera.CameraType = Enum.CameraType.Custom
+		camera.CameraSubject = tHum or tPart
+	end
+end
+
+local function teleportToPlayer(targetPlr)
+	local myChar, myRoot, myHum = getMyParts()
+	local targetPart = getTargetPart(targetPlr)
+	if not myChar or not myRoot or not targetPart then return end
+
+	if myHum and myHum.Sit then
+		myHum.Sit = false
+	end
+	clearSeatWelds(myChar)
+
+	local baseCF = targetPart.CFrame * CFrame.new(0, 0, 3.5)
+	local rayParams = RaycastParams.new()
+	rayParams.FilterType = Enum.RaycastFilterType.Exclude
+	rayParams.FilterDescendantsInstances = { myChar }
+	local rayOrigin = baseCF.Position + Vector3.new(0, 8, 0)
+	local hit = Workspace:Raycast(rayOrigin, Vector3.new(0, -20, 0), rayParams)
+	local landPos = hit and (hit.Position + Vector3.new(0, 3, 0)) or rayOrigin
+	local destination = CFrame.new(landPos, landPos + baseCF.LookVector)
+
+	if myHum then
+		myHum:ChangeState(Enum.HumanoidStateType.Physics)
+	end
+
+	local elapsed = 0
+	local conn
+	conn = RunService.Heartbeat:Connect(function(dt)
+		elapsed += dt
+		if not myRoot or not myRoot.Parent or elapsed >= 0.4 then
+			if conn then conn:Disconnect() end
+			if myHum and myHum.Parent then
+				myHum:ChangeState(Enum.HumanoidStateType.GettingUp)
+			end
+			return
+		end
+		myRoot.AssemblyLinearVelocity = Vector3.zero
+		myRoot.AssemblyAngularVelocity = Vector3.zero
+		myRoot.CFrame = destination
+	end)
+end
+
+local function flingPlayer(targetPlr)
+	if isFlinging then return end
+	local myChar, myRoot, myHum = getMyParts()
+	local targetPart = getTargetPart(targetPlr)
+	if not myChar or not myRoot or not targetPart then return end
+
+	isFlinging = true
+	local savedCFrame = myRoot.CFrame
+	local savedLinVel = myRoot.AssemblyLinearVelocity
+	local savedAngVel = myRoot.AssemblyAngularVelocity
+
+	if myHum then
+		myHum:ChangeState(Enum.HumanoidStateType.Physics)
+	end
+
+	local origCollide = {}
+	for _, d in ipairs(myChar:GetDescendants()) do
+		if d:IsA("BasePart") then
+			origCollide[d] = d.CanCollide
+			d.CanCollide = true
+		end
+	end
+
+	local elapsed, conn = 0, nil
+	conn = RunService.Heartbeat:Connect(function(dt)
+		elapsed += dt
+		local tPart = getTargetPart(targetPlr)
+		if elapsed >= 0.7 or not tPart or not tPart.Parent
+			or not myRoot or not myRoot.Parent then
+			if conn then conn:Disconnect() end
+			for part, c in pairs(origCollide) do
+				if part and part.Parent then part.CanCollide = c end
+			end
+			if myRoot and myRoot.Parent then
+				myRoot.AssemblyLinearVelocity = savedLinVel
+				myRoot.AssemblyAngularVelocity = savedAngVel
+				pcall(function() myChar:PivotTo(savedCFrame) end)
+			end
+			if myHum and myHum.Parent then
+				myHum:ChangeState(Enum.HumanoidStateType.GettingUp)
+			end
+			isFlinging = false
+			return
+		end
+
+		local pos = tPart.Position + tPart.CFrame.LookVector * -2
+		myRoot.CFrame = CFrame.new(pos, tPart.Position)
+		myRoot.AssemblyLinearVelocity = (tPart.Position - myRoot.Position).Unit * 400
+		myRoot.AssemblyAngularVelocity = Vector3.new(4000, 4000, 4000)
+	end)
+end
+
+-- ==========================================
+-- HELPERS (Powers)
+-- ==========================================
+local function getActiveBambooSeat()
+	local char = player.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local seat = hum and hum.SeatPart
+	if seat and (seat.Name == "SwingSeat" or seat.Name == "SwingSeat1") then
+		return seat
+	end
+	return nil
+end
+
+local function resetSeatThrust(seat)
+	if seat and seat:IsDescendantOf(Workspace) then
+		local thrust = seat:FindFirstChild("BodyThrust")
+		if thrust then
+			thrust.Force = Vector3.new(0, 0, 0)
+		end
+	end
+end
+
+local function setupCharacter(char)
+	character = char
+	humanoid = char:WaitForChild("Humanoid")
+	rootPart = char:WaitForChild("HumanoidRootPart")
+
+	humanoid.WalkSpeed = states.speed and config.walkSpeed or 16
+	humanoid.JumpPower = states.jump and config.jumpPower or 50
+	humanoid.UseJumpPower = true
+
+	if states.giant then
+		pcall(function() character:ScaleTo(config.charSize) end)
+	end
+
+	if states.spin then
+		humanoid.AutoRotate = false
+	end
+end
+
+if player.Character then
+	setupCharacter(player.Character)
+end
+player.CharacterAdded:Connect(setupCharacter)
+
+-- ==========================================
+-- MAIN GUI
+-- ==========================================
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "XenoCombinedMenu"
+screenGui.ResetOnSpawn = false
+screenGui.Parent = player:WaitForChild("PlayerGui")
+
+local mainFrame = Instance.new("Frame")
+mainFrame.Size = UDim2.new(0, 380, 0, 460)
+mainFrame.Position = UDim2.new(0.03, 0, 0.15, 0)
+mainFrame.BackgroundColor3 = Color3.fromRGB(18, 20, 28)
+mainFrame.BorderSizePixel = 0
+mainFrame.Active = true
+mainFrame.Draggable = true
+mainFrame.Parent = screenGui
+
+local frameCorner = Instance.new("UICorner")
+frameCorner.CornerRadius = UDim.new(0, 12)
+frameCorner.Parent = mainFrame
+
+local frameStroke = Instance.new("UIStroke")
+frameStroke.Color = Color3.fromRGB(115, 85, 220)
+frameStroke.Thickness = 1.5
+frameStroke.Parent = mainFrame
+
+-- Title
+local titleLabel = Instance.new("TextLabel")
+titleLabel.Size = UDim2.new(1, -90, 0, 34)
+titleLabel.Position = UDim2.new(0, 12, 0, 0)
+titleLabel.BackgroundTransparency = 1
+titleLabel.Text = "⚡ Xeno Combined Menu"
+titleLabel.TextColor3 = Color3.fromRGB(240, 242, 250)
+titleLabel.Font = Enum.Font.GothamBold
+titleLabel.TextSize = 14
+titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+titleLabel.Parent = mainFrame
+
+-- Unview button (Players tab)
+local unviewBtn = Instance.new("TextButton")
+unviewBtn.Size = UDim2.new(0, 70, 0, 26)
+unviewBtn.Position = UDim2.new(1, -110, 0, 5)
+unviewBtn.BackgroundColor3 = Color3.fromRGB(135, 75, 210)
+unviewBtn.Text = "Unview"
+unviewBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+unviewBtn.Font = Enum.Font.GothamBold
+unviewBtn.TextSize = 11
+unviewBtn.Visible = false
+unviewBtn.Parent = mainFrame
+
+local unviewCorner = Instance.new("UICorner")
+unviewCorner.CornerRadius = UDim.new(0, 6)
+unviewCorner.Parent = unviewBtn
+
+-- Close button
+local closeBtn = Instance.new("TextButton")
+closeBtn.Size = UDim2.new(0, 28, 0, 28)
+closeBtn.Position = UDim2.new(1, -34, 0, 4)
+closeBtn.BackgroundColor3 = Color3.fromRGB(205, 55, 65)
+closeBtn.Text = "✕"
+closeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+closeBtn.Font = Enum.Font.GothamBold
+closeBtn.TextSize = 14
+closeBtn.Parent = mainFrame
+
+local closeCorner = Instance.new("UICorner")
+closeCorner.CornerRadius = UDim.new(0, 7)
+closeCorner.Parent = closeBtn
+
+-- Tab buttons
+local tabBar = Instance.new("Frame")
+tabBar.Size = UDim2.new(1, -20, 0, 32)
+tabBar.Position = UDim2.new(0, 10, 0, 38)
+tabBar.BackgroundTransparency = 1
+tabBar.Parent = mainFrame
+
+local playersTabBtn = Instance.new("TextButton")
+playersTabBtn.Size = UDim2.new(0.5, -4, 1, 0)
+playersTabBtn.Position = UDim2.new(0, 0, 0, 0)
+playersTabBtn.BackgroundColor3 = Color3.fromRGB(115, 85, 220)
+playersTabBtn.Text = "Players"
+playersTabBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+playersTabBtn.Font = Enum.Font.GothamBold
+playersTabBtn.TextSize = 13
+playersTabBtn.Parent = tabBar
+
+local powersTabBtn = Instance.new("TextButton")
+powersTabBtn.Size = UDim2.new(0.5, -4, 1, 0)
+powersTabBtn.Position = UDim2.new(0.5, 4, 0, 0)
+powersTabBtn.BackgroundColor3 = Color3.fromRGB(40, 42, 55)
+powersTabBtn.Text = "Powers"
+powersTabBtn.TextColor3 = Color3.fromRGB(200, 200, 210)
+powersTabBtn.Font = Enum.Font.GothamBold
+powersTabBtn.TextSize = 13
+powersTabBtn.Parent = tabBar
+
+local function styleTab(btn, active)
+	if active then
+		btn.BackgroundColor3 = Color3.fromRGB(115, 85, 220)
+		btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+	else
+		btn.BackgroundColor3 = Color3.fromRGB(40, 42, 55)
+		btn.TextColor3 = Color3.fromRGB(180, 185, 200)
+	end
+end
+
+local tabCorner1 = Instance.new("UICorner")
+tabCorner1.CornerRadius = UDim.new(0, 7)
+tabCorner1.Parent = playersTabBtn
+
+local tabCorner2 = Instance.new("UICorner")
+tabCorner2.CornerRadius = UDim.new(0, 7)
+tabCorner2.Parent = powersTabBtn
+
+-- Content frames
+local playersContent = Instance.new("Frame")
+playersContent.Size = UDim2.new(1, -20, 1, -80)
+playersContent.Position = UDim2.new(0, 10, 0, 76)
+playersContent.BackgroundTransparency = 1
+playersContent.Visible = true
+playersContent.Parent = mainFrame
+
+local powersContent = Instance.new("Frame")
+powersContent.Size = UDim2.new(1, -20, 1, -80)
+powersContent.Position = UDim2.new(0, 10, 0, 76)
+powersContent.BackgroundTransparency = 1
+powersContent.Visible = false
+powersContent.Parent = mainFrame
+
+-- ==========================================
+-- PLAYERS TAB CONTENT
+-- ==========================================
+local searchBox = Instance.new("TextBox")
+searchBox.Size = UDim2.new(0.50, -6, 0, 28)
+searchBox.Position = UDim2.new(0, 0, 0, 0)
+searchBox.BackgroundColor3 = Color3.fromRGB(28, 32, 44)
+searchBox.PlaceholderText = "Search name or @user..."
+searchBox.PlaceholderColor3 = Color3.fromRGB(130, 138, 160)
+searchBox.Text = ""
+searchBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+searchBox.Font = Enum.Font.Gotham
+searchBox.TextSize = 11
+searchBox.ClearTextOnFocus = false
+searchBox.Parent = playersContent
+
+local searchCorner = Instance.new("UICorner")
+searchCorner.CornerRadius = UDim.new(0, 6)
+searchCorner.Parent = searchBox
+
+local refreshBtn = Instance.new("TextButton")
+refreshBtn.Size = UDim2.new(0.22, -4, 0, 28)
+refreshBtn.Position = UDim2.new(0.51, 0, 0, 0)
+refreshBtn.BackgroundColor3 = Color3.fromRGB(55, 115, 205)
+refreshBtn.Text = "↻ Refresh"
+refreshBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+refreshBtn.Font = Enum.Font.GothamBold
+refreshBtn.TextSize = 11
+refreshBtn.Parent = playersContent
+
+local refreshCorner = Instance.new("UICorner")
+refreshCorner.CornerRadius = UDim.new(0, 6)
+refreshCorner.Parent = refreshBtn
+
+local autoBtn = Instance.new("TextButton")
+autoBtn.Size = UDim2.new(0.26, -4, 0, 28)
+autoBtn.Position = UDim2.new(0.735, 0, 0, 0)
+autoBtn.BackgroundColor3 = Color3.fromRGB(45, 165, 95)
+autoBtn.Text = "Auto 10s: ON"
+autoBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+autoBtn.Font = Enum.Font.GothamBold
+autoBtn.TextSize = 10
+autoBtn.Parent = playersContent
+
+local autoCorner = Instance.new("UICorner")
+autoCorner.CornerRadius = UDim.new(0, 6)
+autoCorner.Parent = autoBtn
+
+local statusLabel = Instance.new("TextLabel")
+statusLabel.Size = UDim2.new(1, 0, 0, 18)
+statusLabel.Position = UDim2.new(0, 0, 0, 32)
+statusLabel.BackgroundTransparency = 1
+statusLabel.Text = "Players: 0 | Auto-refresh: 10s"
+statusLabel.TextColor3 = Color3.fromRGB(155, 162, 185)
+statusLabel.Font = Enum.Font.Gotham
+statusLabel.TextSize = 11
+statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+statusLabel.Parent = playersContent
+
+local listFrame = Instance.new("ScrollingFrame")
+listFrame.Size = UDim2.new(1, 0, 1, -55)
+listFrame.Position = UDim2.new(0, 0, 0, 52)
+listFrame.BackgroundTransparency = 1
+listFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+listFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+listFrame.ScrollBarThickness = 4
+listFrame.Parent = playersContent
+
+local listLayout = Instance.new("UIListLayout")
+listLayout.Padding = UDim.new(0, 6)
+listLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+listLayout.Parent = listFrame
+
+-- ==========================================
+-- POWERS TAB CONTENT
+-- ==========================================
+local powersScroll = Instance.new("ScrollingFrame")
+powersScroll.Size = UDim2.new(1, 0, 1, 0)
+powersScroll.BackgroundTransparency = 1
+powersScroll.CanvasSize = UDim2.new(0, 0, 0, 720)
+powersScroll.ScrollBarThickness = 4
+powersScroll.Parent = powersContent
+
+local powersLayout = Instance.new("UIListLayout")
+powersLayout.Padding = UDim.new(0, 8)
+powersLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+powersLayout.Parent = powersScroll
+
+local function createToggle(name, defaultOn, callback)
+	local btn = Instance.new("TextButton")
+	btn.Size = UDim2.new(1, -6, 0, 34)
+	btn.BackgroundColor3 = defaultOn and Color3.fromRGB(45, 180, 75) or Color3.fromRGB(180, 45, 45)
+	btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+	btn.Font = Enum.Font.GothamSemibold
+	btn.TextSize = 13
+	btn.Text = name .. (defaultOn and ": ON" or ": OFF")
+	btn.Parent = powersScroll
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 6)
+	corner.Parent = btn
+
+	local active = defaultOn or false
+	btn.MouseButton1Click:Connect(function()
+		active = not active
+		btn.Text = name .. (active and ": ON" or ": OFF")
+		btn.BackgroundColor3 = active and Color3.fromRGB(45, 180, 75) or Color3.fromRGB(180, 45, 45)
+		callback(active)
+	end)
+end
+
+local function createInputBox(labelText, defaultValue, callback)
+	local container = Instance.new("Frame")
+	container.Size = UDim2.new(1, -6, 0, 30)
+	container.BackgroundTransparency = 1
+	container.Parent = powersScroll
+
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.new(0.58, 0, 1, 0)
+	label.BackgroundTransparency = 1
+	label.Text = "  " .. labelText
+	label.TextColor3 = Color3.fromRGB(200, 200, 200)
+	label.Font = Enum.Font.Gotham
+	label.TextSize = 12
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.Parent = container
+
+	local textBox = Instance.new("TextBox")
+	textBox.Size = UDim2.new(0.38, 0, 1, 0)
+	textBox.Position = UDim2.new(0.60, 0, 0, 0)
+	textBox.BackgroundColor3 = Color3.fromRGB(45, 45, 60)
+	textBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+	textBox.Font = Enum.Font.GothamBold
+	textBox.TextSize = 13
+	textBox.Text = tostring(defaultValue)
+	textBox.Parent = container
+
+	local boxCorner = Instance.new("UICorner")
+	boxCorner.CornerRadius = UDim.new(0, 6)
+	boxCorner.Parent = textBox
+
+	textBox.FocusLost:Connect(function()
+		local num = tonumber(textBox.Text)
+		if num then
+			callback(num)
+		else
+			textBox.Text = tostring(defaultValue)
+		end
+	end)
+	return textBox
+end
+
+local function createAction(name, callback)
+	local btn = Instance.new("TextButton")
+	btn.Size = UDim2.new(1, -6, 0, 34)
+	btn.BackgroundColor3 = Color3.fromRGB(50, 120, 220)
+	btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+	btn.Font = Enum.Font.GothamSemibold
+	btn.TextSize = 13
+	btn.Text = name
+	btn.Parent = powersScroll
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 6)
+	corner.Parent = btn
+
+	btn.MouseButton1Click:Connect(function() callback() end)
+end
+
+local function updateAngleButtons()
+	for deg, btn in pairs(angleButtons) do
+		local selected = (config.swingAngle == deg)
+		btn.BackgroundColor3 = selected and Color3.fromRGB(45, 140, 220) or Color3.fromRGB(45, 45, 60)
+	end
+	if angleInputBox then
+		angleInputBox.Text = tostring(config.swingAngle)
+	end
+end
+
+local function createAnglePresetRow()
+	local row = Instance.new("Frame")
+	row.Size = UDim2.new(1, -6, 0, 30)
+	row.BackgroundTransparency = 1
+	row.Parent = powersScroll
+
+	local layout = Instance.new("UIListLayout")
+	layout.FillDirection = Enum.FillDirection.Horizontal
+	layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+	layout.Padding = UDim.new(0, 6)
+	layout.Parent = row
+
+	for _, deg in ipairs({90, 180, 360}) do
+		local btn = Instance.new("TextButton")
+		btn.Size = UDim2.new(0.31, 0, 1, 0)
+		btn.Text = deg .. "°"
+		btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+		btn.Font = Enum.Font.GothamBold
+		btn.TextSize = 12
+		btn.Parent = row
+
+		local c = Instance.new("UICorner")
+		c.CornerRadius = UDim.new(0, 6)
+		c.Parent = btn
+
+		angleButtons[deg] = btn
+		btn.MouseButton1Click:Connect(function()
+			config.swingAngle = deg
+			swingCyclePhase = 0
+			updateAngleButtons()
+		end)
+	end
+	updateAngleButtons()
+end
+
+-- Build Powers UI
+createToggle("🎋 Bamboo Swing", true, function(isOn)
+	states.bambooSwing = isOn
+	swingCyclePhase = 0
+	if not isOn then
+		resetSeatThrust(activeSwingSeat)
+		activeSwingSeat = nil
+	end
+end)
+createAnglePresetRow()
+angleInputBox = createInputBox("Custom Angle (°):", config.swingAngle, function(val)
+	config.swingAngle = math.clamp(val, 15, 720)
+	swingCyclePhase = 0
+	updateAngleButtons()
+end)
+createInputBox("Swing Force:", config.swingForce, function(val)
+	config.swingForce = math.max(0, val)
+end)
+
+createToggle("🌪️ Tornado Spin", false, function(isOn)
+	states.spin = isOn
+	if humanoid then humanoid.AutoRotate = not isOn end
+end)
+createInputBox("Spin Speed:", config.spinSpeed, function(val) config.spinSpeed = val end)
+
+createToggle("🕊️ Fly Mode", false, function(isOn)
+	states.fly = isOn
+	if not rootPart or not humanoid then return end
+	if isOn then
+		humanoid.PlatformStand = true
+		flyBodyGyro = Instance.new("BodyGyro", rootPart)
+		flyBodyGyro.P = 9e4
+		flyBodyGyro.MaxTorque = Vector3.new(9e9, 9e9, 9e9)
+		flyBodyGyro.CFrame = rootPart.CFrame
+
+		flyBodyVelocity = Instance.new("BodyVelocity", rootPart)
+		flyBodyVelocity.Velocity = Vector3.new(0,0,0)
+		flyBodyVelocity.MaxForce = Vector3.new(9e9, 9e9, 9e9)
+	else
+		humanoid.PlatformStand = false
+		if flyBodyGyro then flyBodyGyro:Destroy() end
+		if flyBodyVelocity then flyBodyVelocity:Destroy() end
+	end
+end)
+createInputBox("Fly Speed:", config.flySpeed, function(val) config.flySpeed = val end)
+
+createToggle("⚡ Super Speed", false, function(isOn)
+	states.speed = isOn
+	if humanoid then humanoid.WalkSpeed = isOn and config.walkSpeed or 16 end
+end)
+createInputBox("Walk Speed:", config.walkSpeed, function(val)
+	config.walkSpeed = val
+	if states.speed and humanoid then humanoid.WalkSpeed = val end
+end)
+
+createToggle("🚀 Super Jump", false, function(isOn)
+	states.jump = isOn
+	if humanoid then
+		humanoid.UseJumpPower = true
+		humanoid.JumpPower = isOn and config.jumpPower or 50
+	end
+end)
+createInputBox("Jump Power:", config.jumpPower, function(val)
+	config.jumpPower = val
+	if states.jump and humanoid then humanoid.JumpPower = val end
+end)
+
+createToggle("🐘 Size / Height", false, function(isOn)
+	states.giant = isOn
+	if character then
+		pcall(function() character:ScaleTo(isOn and config.charSize or 1.0) end)
+	end
+end)
+createInputBox("Size Scale:", config.charSize, function(val)
+	config.charSize = val
+	if states.giant and character then
+		pcall(function() character:ScaleTo(val) end)
+	end
+end)
+
+createAction("💨 Quick Dash Forward", function()
+	if rootPart then
+		rootPart.AssemblyLinearVelocity = camera.CFrame.LookVector * 120 + Vector3.new(0, 50, 0)
+	end
+end)
+
+-- ==========================================
+-- TAB SWITCHING
+-- ==========================================
+local function switchTab(tab)
+	if tab == "Players" then
+		playersContent.Visible = true
+		powersContent.Visible = false
+		styleTab(playersTabBtn, true)
+		styleTab(powersTabBtn, false)
+	else
+		playersContent.Visible = false
+		powersContent.Visible = true
+		styleTab(playersTabBtn, false)
+		styleTab(powersTabBtn, true)
+	end
+end
+
+playersTabBtn.MouseButton1Click:Connect(function() switchTab("Players") end)
+powersTabBtn.MouseButton1Click:Connect(function() switchTab("Powers") end)
+
+-- ==========================================
+-- PLAYERS LIST LOGIC
+-- ==========================================
+local refreshTimer = 10
+local refreshQueued = false
+
+local function refreshList()
+	refreshTimer = 10
+	for _, child in ipairs(listFrame:GetChildren()) do
+		if not child:IsA("UIListLayout") then
+			child:Destroy()
+		end
+	end
+
+	local filter = searchBox.Text:lower():gsub("^%s+", ""):gsub("%s+$", "")
+	local candidates = {}
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= player then
+			local dName = plr.DisplayName:lower()
+			local uName = plr.Name:lower()
+			if filter == "" or dName:find(filter, 1, true) or uName:find(filter, 1, true) then
+				table.insert(candidates, plr)
+			end
+		end
+	end
+	table.sort(candidates, function(a, b)
+		return a.Name:lower() < b.Name:lower()
+	end)
+
+	statusLabel.Text = "Players: " .. #candidates .. " | Auto-refresh: " .. (autoRefreshEnabled and "10s" or "OFF")
+
+	for _, plr in ipairs(candidates) do
+		local isViewingThis = (spectatingTarget == plr)
+		local row = Instance.new("Frame")
+		row.Size = UDim2.new(1, -4, 0, 42)
+		row.BackgroundColor3 = isViewingThis and Color3.fromRGB(40, 32, 62) or Color3.fromRGB(28, 32, 44)
+		row.BorderSizePixel = 0
+		row.Parent = listFrame
+
+		local rc = Instance.new("UICorner")
+		rc.CornerRadius = UDim.new(0, 7)
+		rc.Parent = row
+
+		local nameLbl = Instance.new("TextLabel")
+		nameLbl.Size = UDim2.new(0.42, -6, 1, 0)
+		nameLbl.Position = UDim2.new(0, 8, 0, 0)
+		nameLbl.BackgroundTransparency = 1
+		nameLbl.Text = plr.DisplayName .. "\n@" .. plr.Name
+		nameLbl.TextColor3 = Color3.fromRGB(240, 242, 255)
+		nameLbl.Font = Enum.Font.GothamSemibold
+		nameLbl.TextSize = 11
+		nameLbl.TextXAlignment = Enum.TextXAlignment.Left
+		nameLbl.Parent = row
+
+		local function makeBtn(text, xPos, wScale, bgColor, onClick)
+			local b = Instance.new("TextButton")
+			b.Size = UDim2.new(wScale, -3, 0.72, 0)
+			b.Position = UDim2.new(xPos, 0, 0.14, 0)
+			b.BackgroundColor3 = bgColor
+			b.Text = text
+			b.TextColor3 = Color3.fromRGB(255, 255, 255)
+			b.Font = Enum.Font.GothamBold
+			b.TextSize = 10
+			b.Parent = row
+
+			local bc = Instance.new("UICorner")
+			bc.CornerRadius = UDim.new(0, 5)
+			bc.Parent = b
+
+			b.MouseButton1Click:Connect(onClick)
+			return b
+		end
+
+		makeBtn("TP", 0.43, 0.17, Color3.fromRGB(55, 115, 205), function()
+			teleportToPlayer(plr)
+		end)
+		makeBtn(isViewingThis and "Stop" or "View", 0.60, 0.18, isViewingThis and Color3.fromRGB(165, 65, 185) or Color3.fromRGB(100, 75, 185), function()
+			toggleViewPlayer(plr)
+			refreshList()
+		end)
+		makeBtn("Fling", 0.78, 0.20, Color3.fromRGB(215, 95, 45), function()
+			flingPlayer(plr)
+		end)
+	end
+
+	listFrame.CanvasSize = UDim2.new(0, 0, 0, listLayout.AbsoluteContentSize.Y + 10)
+end
+
+local function scheduleRefresh()
+	if refreshQueued then return end
+	refreshQueued = true
+	task.defer(function()
+		refreshQueued = false
+		refreshList()
+	end)
+end
+
+unviewBtn.MouseButton1Click:Connect(function()
+	stopViewing()
+	refreshList()
+end)
+
+refreshBtn.MouseButton1Click:Connect(refreshList)
+
+autoBtn.MouseButton1Click:Connect(function()
+	autoRefreshEnabled = not autoRefreshEnabled
+	autoBtn.Text = autoRefreshEnabled and "Auto 10s: ON" or "Auto 10s: OFF"
+	autoBtn.BackgroundColor3 = autoRefreshEnabled and Color3.fromRGB(45, 165, 95) or Color3.fromRGB(70, 75, 92)
+	refreshTimer = 10
+	statusLabel.Text = "Players: " .. math.max(0, #Players:GetPlayers() - 1) .. " | Auto-refresh: " .. (autoRefreshEnabled and "10s" or "OFF")
+end)
+
+trackConn(searchBox:GetPropertyChangedSignal("Text"):Connect(scheduleRefresh))
+trackConn(Players.PlayerAdded:Connect(scheduleRefresh))
+trackConn(Players.PlayerRemoving:Connect(function(leftPlr)
+	if spectatingTarget == leftPlr then
+		stopViewing()
+	end
+	scheduleRefresh()
+end))
+
+-- ==========================================
+-- MAIN UPDATE LOOP
+-- ==========================================
+trackConn(RunService.Heartbeat:Connect(function(dt)
+	-- Spectate cleanup
+	if spectatingTarget and not spectatingTarget.Parent then
+		stopViewing()
+	end
+
+	-- Auto refresh countdown
+	if autoRefreshEnabled then
+		refreshTimer -= dt
+		local shownCount = math.max(0, #Players:GetPlayers() - 1)
+		local secsLeft = math.max(1, math.ceil(refreshTimer))
+		statusLabel.Text = "Players: " .. shownCount .. " | Next refresh: " .. secsLeft .. "s"
+		if refreshTimer <= 0 then
+			refreshList()
+		end
+	end
+end))
+
+local renderConn = RunService.RenderStepped:Connect(function(dt)
+	-- Bamboo Swing
+	local seat = getActiveBambooSeat()
+	if seat ~= activeSwingSeat then
+		resetSeatThrust(activeSwingSeat)
+		activeSwingSeat = seat
+		swingCyclePhase = 0
+	end
+
+	if states.bambooSwing and activeSwingSeat then
+		local thrust = activeSwingSeat:FindFirstChild("BodyThrust")
+		local gyro = activeSwingSeat:FindFirstChild("BodyGyro")
+
+		if thrust then
+			local angle = config.swingAngle
+			if angle >= 300 then
+				if gyro then
+					gyro.MaxTorque = Vector3.new(0, 400000, 400000)
+				end
+				local speed = activeSwingSeat.AssemblyLinearVelocity:Dot(activeSwingSeat.CFrame.LookVector)
+				thrust.Force = Vector3.new(0, 0, speed >= 0 and -config.swingForce or config.swingForce)
+			else
+				local scale = math.clamp(angle / 180, 0.35, 1.35)
+				swingCyclePhase = swingCyclePhase + dt * (2.6 / math.sqrt(scale))
+				local wave = math.sin(swingCyclePhase)
+				thrust.Force = Vector3.new(0, 0, -wave * config.swingForce * scale)
+			end
+		end
+	elseif activeSwingSeat then
+		resetSeatThrust(activeSwingSeat)
+	end
+
+	if not character or not humanoid or humanoid.Health <= 0 or not rootPart then return end
+
+	-- Flight
+	if states.fly and flyBodyVelocity and flyBodyGyro then
+		local moveDir = Vector3.new(0, 0, 0)
+		if UserInputService:IsKeyDown(Enum.KeyCode.W) then moveDir = moveDir + camera.CFrame.LookVector end
+		if UserInputService:IsKeyDown(Enum.KeyCode.S) then moveDir = moveDir - camera.CFrame.LookVector end
+		if UserInputService:IsKeyDown(Enum.KeyCode.A) then moveDir = moveDir - camera.CFrame.RightVector end
+		if UserInputService:IsKeyDown(Enum.KeyCode.D) then moveDir = moveDir + camera.CFrame.RightVector end
+		if UserInputService:IsKeyDown(Enum.KeyCode.Space) then moveDir = moveDir + Vector3.new(0, 1, 0) end
+		if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then moveDir = moveDir - Vector3.new(0, 1, 0) end
+
+		flyBodyVelocity.Velocity = (moveDir.Magnitude > 0 and moveDir.Unit or Vector3.new(0, 0, 0)) * config.flySpeed
+		if not states.spin then
+			flyBodyGyro.CFrame = camera.CFrame
+		end
+	end
+
+	-- Spin
+	if states.spin then
+		rootPart.CFrame = rootPart.CFrame * CFrame.Angles(0, math.rad(config.spinSpeed * dt), 0)
+		if states.fly and flyBodyGyro then
+			flyBodyGyro.CFrame = rootPart.CFrame
+		end
+	end
+end)
+
+-- Close everything cleanly
+closeBtn.MouseButton1Click:Connect(function()
+	isFlinging = false
+	stopViewing()
+	states.bambooSwing = false
+	resetSeatThrust(activeSwingSeat)
+
+	if renderConn then renderConn:Disconnect() end
+	for _, conn in ipairs(connections) do
+		if conn.Connected then conn:Disconnect() end
+	end
+	screenGui:Destroy()
+end)
+
+-- Initial load
+refreshList()
+switchTab("Players")
